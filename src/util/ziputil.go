@@ -34,6 +34,7 @@ func main() {
 	// Need mandatory flags, else print usage
 	if strings.EqualFold(*files, "") || strings.EqualFold(*output, "") {
 		Usage()
+		log.Fatal("Program exiting.")
 	}
 
 	// A way to visit each flag (includes specificed and unspecified)
