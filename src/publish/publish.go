@@ -22,7 +22,7 @@ var (
 	machine, port, admin, pwd, inputfile string
 	
 	gpMaxInstances float64 = 5
-	publishers int = 5
+	threads int = 5
 )
 
 var (
@@ -273,6 +273,9 @@ func main() {
 	// Admin token
 	token = getToken(admin, pwd, machine, port)
 
+	// Delete all uploads
+	deleteAllUploadItems()
+
 	// Some globals
 	pubList := list.New()
 
@@ -327,6 +330,12 @@ func main() {
 	// For blocking until all done
 	doneChan := make(chan map[string]string, pubList.Len())
 
+	// Allow only 5 simultanous publishers
+	semaphoresChan := make(chan int, threads)
+	for i := 1; i <= threads; i++ {
+		semaphoresChan <- 1
+	}
+
 	// standard service types
 	serviceTypes := []string{"MapServer", "GeometryServer", "GPServer", "ImageServer", 
 	 	"GeocodeServer","GeodataServer", "FeatureServer", "GlobeServer", "SearchServer"}
@@ -337,6 +346,14 @@ func main() {
 	for e := pubList.Front(); e != nil; e = e.Next() {
 		// delete service if it exists
 		go func(info ServiceInfo) {
+			// Grab Semaphore
+			<-semaphoresChan
+			
+			// Eventually release
+			defer func () {
+				semaphoresChan <- 1
+			}()
+			
 			defer func() {
 				deleteDone <- 1
 			}()
@@ -398,13 +415,7 @@ func main() {
 			fmt.Println("Min instance count increased to 5 ", jsonResp["status"])
 		}
 	}
-
-	// Allow only 5 simultanous publishers
-	semaphoresChan := make(chan int, publishers)
-	for i := 1; i <= publishers; i++ {
-		semaphoresChan <- 1
-	}
-
+	
 	// For each item
 	for e := pubList.Front(); e != nil; e = e.Next() {
 		info := e.Value.(ServiceInfo)
