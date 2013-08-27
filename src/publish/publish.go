@@ -18,14 +18,11 @@ import (
 	"time"
 )
 
-const (
-	machine string	= "winlab1"
-	port string			= "6080"
-	admin string 		= "admin"
-	pwd string 			= "admin"
+var (
+	machine, port, admin, pwd, inputfile string
 	
 	gpMaxInstances float64 = 5
-	publishers int = 7
+	publishers int = 5
 )
 
 var (
@@ -53,6 +50,7 @@ func parseJSON(resp *http.Response) map[string]interface{} {
 		fmt.Println(resp.Status)
 		fmt.Println(resp.StatusCode)
 		fmt.Println("JSON Unmarshaling error ", string(resBytes))
+		return map[string]interface{}{"status": "error"}
 	}
 
 	m := respJson.(map[string]interface{})
@@ -60,6 +58,18 @@ func parseJSON(resp *http.Response) map[string]interface{} {
 		log.Print("Server error ")
 	}
 	return m
+}
+
+func makeRequestForJSON(verb, reqUrl string, args, headers map[string]string) map[string]interface{} {
+	var httpResp *http.Response
+	var err error
+	if httpResp, err = makeRequest(verb, reqUrl, args, headers); err != nil {
+		log.Fatal(err)
+	}
+	responseJson := parseJSON(httpResp)	
+	httpResp.Body.Close()
+	
+	return responseJson
 }
 
 /*
@@ -172,8 +182,7 @@ func uploadRequest(reqUrl string, args, headers map[string]string, filepath stri
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
-	res, err := client.Do(req)
-	return res, err
+	return client.Do(req)
 }
 
 /*
@@ -188,15 +197,8 @@ func getToken(username, password, serverName, port string) string {
 		"password": password,
 		"client":   "requestip"}
 
-	resp, err := makeRequest("POST", tokenURL, params, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	// Parse JSON
-	m := parseJSON(resp)
-	return m["token"].(string)
+	tokenJson := makeRequestForJSON("POST", tokenURL, params, nil)
+	return tokenJson["token"].(string)
 }
 
 type ServiceInfo struct {
@@ -222,16 +224,10 @@ func NewServiceInfo(sd string) ServiceInfo {
 
 func deleteAllUploadItems() {
 	// All uploads
-	machine := "winlab1"
-	port := "6080"
 	contextUrl := "http://" + machine + ":" + port + "/arcgis/admin"
-	var resp *http.Response
-	var err error
-	if resp, err = makeRequest("GET", contextUrl+"/uploads", nil, nil); err != nil {
-		log.Fatal(err)
-	}
-	allItems := parseJSON(resp)["items"].([]interface{})
-	resp.Body.Close()
+	
+	allItemsJson := makeRequestForJSON("GET", contextUrl+"/uploads", nil, nil)
+	allItems := allItemsJson["items"].([]interface{})
 
 	done := make(chan int, len(allItems))
 
@@ -243,16 +239,12 @@ func deleteAllUploadItems() {
 		func(id string) {
 			deleteUrl := contextUrl + "/uploads/" + itemID + "/delete"
 			fmt.Println("Deleting item ", itemID, "at ", deleteUrl)
-			if resp, err = makeRequest("POST", deleteUrl, nil, nil); err != nil {
-				log.Fatal(err)
-			}			
-
-			responseJson := parseJSON(resp)
+			
+			responseJson := makeRequestForJSON("POST", deleteUrl, nil, nil)
 			if responseJson["status"] != "success" {
 				fmt.Println("Failed to delete item " + itemID)
 			}
 			
-			resp.Body.Close()
 			done <- 1
 		}(itemID)
 	}
@@ -265,7 +257,15 @@ func deleteAllUploadItems() {
 
 func main() {
 	t0 := time.Now()
+	fmt.Println("This tool publishes services described in a pipe-deliminted text file.")
+	fmt.Println("For examples, refer http://bit.ly/19JbADR\n")
+	
+	fmt.Printf("Enter input as space separated values: [server] [port] [user] [password] [Path to pipe-delimited text file]\n") 
+	fmt.Fscanf(os.Stdin, "%s %s %s %s %s", &machine, &port, &admin, &pwd, &inputfile)
 
+	//TODO: Check if server is running
+	//TODO: Check if input file exists
+		
 	// Context URL
 	contextUrl := "http://" + machine + ":" + port + "/arcgis/admin"
 	servicesUrl := "http://" + machine + ":" + port + "/arcgis/rest/services"
@@ -273,18 +273,13 @@ func main() {
 	// Admin token
 	token = getToken(admin, pwd, machine, port)
 
-	// Delete all previously uploaded items
-	deleteAllUploadItems()
-
 	// Some globals
-	var f *os.File
-	var err error
-	var resp *http.Response
-
 	pubList := list.New()
 
 	// Open input file
-	if f, err = os.Open("c:/github/go-projects/src/publish/services.txt"); err != nil {
+	var f *os.File
+	var err error
+	if f, err = os.Open(inputfile); err != nil {
 		log.Fatal(err)				
 	}
 
@@ -320,11 +315,9 @@ func main() {
 
 	// get a list of machines in the site
 	machinesUrl := contextUrl + "/machines"
-	if resp, err = makeRequest("GET", machinesUrl, nil, nil); err != nil {
-		log.Fatal(err)
-	}	
-	machinesJson := parseJSON(resp)["machines"].([]interface{})
-	resp.Body.Close()
+	
+	machinesJson := makeRequestForJSON("GET", machinesUrl, nil, nil)["machines"].([]interface{})
+
 	machines := make([]string, len(machinesJson))
 	for i, v := range machinesJson {
 		values := v.(map[string]interface{})
@@ -339,6 +332,7 @@ func main() {
 	 	"GeocodeServer","GeodataServer", "FeatureServer", "GlobeServer", "SearchServer"}
 
 	// To track deletes
+	fmt.Println("Deleting old services")
 	deleteDone := make(chan int, pubList.Len())
 	for e := pubList.Front(); e != nil; e = e.Next() {
 		// delete service if it exists
@@ -353,14 +347,12 @@ func main() {
 
 			for _, value := range serviceTypes {
 				// Check if the service exists
-				existsUrl := contextUrl + "/services/" + info.folder + "/" + service + "." + value
-				if resp, err = makeRequest("GET", existsUrl, nil, nil); err != nil {
-					log.Println(err)
-				}
-				respJson := parseJSON(resp)
-				resp.Body.Close()
-				if respJson["code"] != nil {
-					if respJson["code"].(float64) == 404 {
+				existsUrl := contextUrl + "/services/" + info.folder + "/" + service + "." + value				
+				respJson := makeRequestForJSON("GET", existsUrl, nil, nil)
+				if respJson["status"] != nil && respJson["status"] == "error" {
+					continue
+				} else if respJson["code"] != nil {
+						if respJson["code"].(float64) == 404 {
 						continue
 					}
 				}
@@ -368,17 +360,14 @@ func main() {
 				// Delete it
 				adminUrl := machines[rand.Intn(len(machines))] // randomly pick a machine
 				deleteUrl := adminUrl + "/services/" + info.folder + "/" + service + "." + value + "/delete"
-				fmt.Println(deleteUrl)
-				if resp, err = makeRequest("POST", deleteUrl, nil, nil); err != nil {
-					log.Println(err)
-				}				
-				respJson = parseJSON(resp)
+				fmt.Println("Deleting ", deleteUrl)
+				
+				respJson = makeRequestForJSON("POST", deleteUrl, nil, nil)
 				if respJson["status"] != nil {
 					if respJson["status"].(string) != "success" {
-						log.Println("Failed to delete service ", parseJSON(resp)["messages"])
+						log.Println("Failed to delete service ", respJson)
 					}
 				}
-				resp.Body.Close()
 			}
 		}(e.Value.(ServiceInfo))
 	}
@@ -389,12 +378,9 @@ func main() {
 	fmt.Println("Old services deleted")
 
 	// Edit publishing tool max instances
-	pubUrl := contextUrl + "/services/System/PublishingTools.GPServer"
-	if resp, err = makeRequest("GET", pubUrl, nil, nil); err != nil {
-		log.Fatal(err)
-	}	
-	jsonResp := parseJSON(resp)
-	resp.Body.Close()
+	fmt.Println("Increasing number of instances of the Publishing tool")
+	pubUrl := contextUrl + "/services/System/PublishingTools.GPServer"	
+	jsonResp := makeRequestForJSON("GET", pubUrl, nil, nil)
 	minCnt := jsonResp["minInstancesPerNode"].(float64)
 
 	// Increase it to 5
@@ -403,13 +389,8 @@ func main() {
 		jsonResp["maxInstancesPerNode"] = gpMaxInstances
 		editUrl := contextUrl + "/services/System/PublishingTools.GPServer/edit"
 		jsonBytes, _ := json.Marshal(jsonResp)
-		resp, err = makeRequest("POST", editUrl,
-			map[string]string{"service": string(jsonBytes)}, nil)
-		if err != nil {
-			log.Fatal(err)
-		}
-		jsonResp = parseJSON(resp)
-		resp.Body.Close()
+
+		jsonResp := makeRequestForJSON("POST", editUrl, map[string]string{"service": string(jsonBytes)}, nil)
 		if jsonResp["status"] == "error" {
 			fmt.Println("Failed to increase min instance count increased to 5 ", jsonResp["messages"])
 			os.Exit(0)
@@ -430,24 +411,24 @@ func main() {
 
 		// Upload & Publish
 		go func(srvInfo ServiceInfo) {		
-			// Grab Semaphore			
+			// Grab Semaphore
 			<-semaphoresChan
 			
 			// Eventually release
-			defer func () {				
+			defer func () {
 				semaphoresChan <- 1
-				fmt.Println("Released semaphore")
 			}()
 
 			// Upload
-			fmt.Println("Uploading ", info.sd)
 			adminUrl := machines[rand.Intn(len(machines))] // randomly pick one from the available machines
-			resp, err = uploadRequest(adminUrl+"/uploads/upload", nil, nil, info.sd)
+			var httpResp *http.Response
+			var err error
+			httpResp, err = uploadRequest(adminUrl+"/uploads/upload", nil, nil, info.sd) 
 			if err != nil {
 				log.Fatal(err)
 			}			
-			itemJson := parseJSON(resp)
-			resp.Body.Close()
+			itemJson := parseJSON(httpResp)
+			httpResp.Body.Close()
 
 			if itemJson["status"].(string) == "error" {
 				log.Println(itemJson["messages"])
@@ -460,12 +441,7 @@ func main() {
 			itemID := item["itemID"].(string)
 
 			// Get service configuration json
-			if resp, err = makeRequest("GET", adminUrl+"/uploads/"+itemID+"/serviceconfiguration.json",
-				nil, nil); err != nil {
-				log.Println(err)
-			}			
-			srvConfigJson := parseJSON(resp) // returns map[string]interface{}
-			resp.Body.Close()
+			srvConfigJson := makeRequestForJSON("GET", adminUrl+"/uploads/"+itemID+"/serviceconfiguration.json", nil, nil)
 
 			// Edit service configuration if there are overrides
 			if srvInfo.cluster != "" || srvInfo.folder != "" || srvInfo.service != "" {
@@ -481,18 +457,23 @@ func main() {
 				}
 			}
 
+//			// Grab Semaphore
+//			<-semaphoresChan
+//			
+//			// Eventually release
+//			defer func () {
+//				semaphoresChan <- 1
+//			}()
+
 			// Publish job
 			configBytes, err := json.Marshal(srvConfigJson)
 			if err != nil {
 				log.Println(err)
 			}
-			if resp, err = makeRequest("POST", servicesUrl+"/System/PublishingTools/GPServer/Publish%20Service%20Definition/submitJob",
-				map[string]string{
-					"in_sdp_id":           itemID,
-					"in_config_overwrite": string(configBytes)}, nil); err != nil {
-			}			
-			jobIdResp := parseJSON(resp)
-			resp.Body.Close()
+			
+			jobIdResp := makeRequestForJSON("POST", 
+					servicesUrl+"/System/PublishingTools/GPServer/Publish%20Service%20Definition/submitJob", 
+					map[string]string{"in_sdp_id":itemID,"in_config_overwrite": string(configBytes)}, nil)
 
 			// Got the jobid
 			jobID := jobIdResp["jobId"].(string)
@@ -502,19 +483,18 @@ func main() {
 
 			// Poll for job status
 			status := "esriJobSubmitted"
-			var jobStatus map[string]interface{}
 			for status == "esriJobSubmitted" || status == "esriJobExecuting" {
 				// Get job status
-				if resp, err = makeRequest("GET",
-					servicesUrl+"/System/PublishingTools/GPServer/Publish%20Service%20Definition/jobs/"+jobID+"/status", nil, nil); err != nil {
-				}
-				jobStatus = parseJSON(resp)
-				status = jobStatus["jobStatus"].(string)
-				//fmt.Println(status)
+				jobStatus := makeRequestForJSON("GET", 
+					servicesUrl+"/System/PublishingTools/GPServer/Publish%20Service%20Definition/jobs/"+jobID+"/status", 
+					nil, nil)
 
+				if jobStatus["jobStatus"] != nil {
+					status = jobStatus["jobStatus"].(string)
+				}
+				
 				// Sleep a little
-				time.Sleep(10 * time.Second)				
-				resp.Body.Close()
+				time.Sleep(5 * time.Second)				
 			}
 
 			if status != "esriJobSucceeded" {
@@ -525,9 +505,7 @@ func main() {
 			
 			// Delete the uploaded item (fire and forget)
 			go func() {
-				deleteUrl := adminUrl + "/uploads/" + itemID + "/delete"
-				resp, err = makeRequest("POST", deleteUrl, nil, nil)
-				resp.Body.Close()
+				makeRequestForJSON("POST", adminUrl+"/uploads/"+itemID+"/delete", nil, nil)
 			}()
 		}(info)
 	}
@@ -538,6 +516,7 @@ func main() {
 		result := <- doneChan
 		for k, v := range result {
 			results[k] = v
+			fmt.Println(k ,":",v)
 		}
 	}
 	// Print summary
