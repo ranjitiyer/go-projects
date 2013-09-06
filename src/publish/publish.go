@@ -22,7 +22,9 @@ var (
 	machine, port, admin, pwd, inputfile string
 	
 	gpMaxInstances float64 = 5
-	threads int = 5
+	
+	pubThreads int = 5
+	delThreads int = 10
 )
 
 var (
@@ -260,6 +262,12 @@ func main() {
 	fmt.Println("This tool publishes services described in a pipe-deliminted text file.")
 	fmt.Println("For examples, refer http://bit.ly/19JbADR\n")
 	
+//	machine = "import2"
+//	port = "6080"
+//	admin = "admin"
+//	pwd = "admin"
+//	inputfile = "C:\\github\\go-projects\\src\\publish\\services.txt"
+ 
 	fmt.Printf("Enter input as space separated values: [server] [port] [user] [password] [Path to pipe-delimited text file]\n") 
 	fmt.Fscanf(os.Stdin, "%s %s %s %s %s", &machine, &port, &admin, &pwd, &inputfile)
 
@@ -330,10 +338,10 @@ func main() {
 	// For blocking until all done
 	doneChan := make(chan map[string]string, pubList.Len())
 
-	// Allow only 5 simultanous publishers
-	semaphoresChan := make(chan int, threads)
-	for i := 1; i <= threads; i++ {
-		semaphoresChan <- 1
+	// Simultaneous delete threads
+	deletersChan := make(chan int, delThreads)
+	for i := 1; i <= delThreads; i++ {
+		deletersChan <- 1
 	}
 
 	// standard service types
@@ -347,11 +355,11 @@ func main() {
 		// delete service if it exists
 		go func(info ServiceInfo) {
 			// Grab Semaphore
-			<-semaphoresChan
+			<-deletersChan
 			
 			// Eventually release
 			defer func () {
-				semaphoresChan <- 1
+				deletersChan <- 1
 			}()
 			
 			defer func() {
@@ -364,7 +372,7 @@ func main() {
 
 			for _, value := range serviceTypes {
 				// Check if the service exists
-				existsUrl := contextUrl + "/services/" + info.folder + "/" + service + "." + value				
+  			existsUrl := contextUrl + "/services/" + info.folder + "/" + service + "." + value				
 				respJson := makeRequestForJSON("GET", existsUrl, nil, nil)
 				if respJson["status"] != nil && respJson["status"] == "error" {
 					continue
@@ -376,7 +384,7 @@ func main() {
 
 				// Delete it
 				adminUrl := machines[rand.Intn(len(machines))] // randomly pick a machine
-				deleteUrl := adminUrl + "/services/" + info.folder + "/" + service + "." + value + "/delete"
+ 			  deleteUrl := adminUrl + "/services/" + info.folder + "/" + service + "." + value + "/delete"
 				fmt.Println("Deleting ", deleteUrl)
 				
 				respJson = makeRequestForJSON("POST", deleteUrl, nil, nil)
@@ -416,24 +424,22 @@ func main() {
 		}
 	}
 	
+	// Simultanous publishers
+	semaphoresChan := make(chan int, pubThreads)
+	for i := 1; i <= pubThreads; i++ {
+		semaphoresChan <- 1
+	}	
+	
 	// For each item
 	for e := pubList.Front(); e != nil; e = e.Next() {
 		info := e.Value.(ServiceInfo)
-
 		// Upload & Publish
 		go func(srvInfo ServiceInfo) {		
-			// Grab Semaphore
-			<-semaphoresChan
-			
-			// Eventually release
-			defer func () {
-				semaphoresChan <- 1
-			}()
-
 			// Upload
 			adminUrl := machines[rand.Intn(len(machines))] // randomly pick one from the available machines
 			var httpResp *http.Response
 			var err error
+			fmt.Println("Uploading ", info.sd)
 			httpResp, err = uploadRequest(adminUrl+"/uploads/upload", nil, nil, info.sd) 
 			if err != nil {
 				log.Fatal(err)
@@ -468,13 +474,13 @@ func main() {
 				}
 			}
 
-//			// Grab Semaphore
-//			<-semaphoresChan
-//			
-//			// Eventually release
-//			defer func () {
-//				semaphoresChan <- 1
-//			}()
+			// Grab Semaphore
+			<-semaphoresChan
+			
+			// Eventually release
+			defer func () {
+				semaphoresChan <- 1
+			}()
 
 			// Publish job
 			configBytes, err := json.Marshal(srvConfigJson)
@@ -490,7 +496,7 @@ func main() {
 			jobID := jobIdResp["jobId"].(string)
 
 			// Sleep before getting status
-			time.Sleep(5 * time.Second)
+			time.Sleep(5 * time.Second)		
 
 			// Poll for job status
 			status := "esriJobSubmitted"
@@ -507,6 +513,8 @@ func main() {
 				// Sleep a little
 				time.Sleep(5 * time.Second)				
 			}
+			
+			fmt.Println(srvInfo.service, ":", status)
 
 			if status != "esriJobSucceeded" {
 				doneChan <- map[string]string{srvInfo.service:"failed"}
@@ -521,18 +529,37 @@ func main() {
 		}(info)
 	}
 
-	// Wait for all and collect results 
-	results := map[string]string{}
-	for i := 0; i < pubList.Len(); i++ {
-		result := <- doneChan
-		for k, v := range result {
-			results[k] = v
-			fmt.Println(k ,":",v)
+	results := map[string]string{}	
+	exitChan := make(chan string, 1)
+	
+	go func () {
+		// eventually signal exit
+		defer func() {
+			exitChan <- "exit"
+		}()
+		// loop until all results or a timeout occurs
+		for len(results) < pubList.Len() { 
+			select {
+				case result := <- doneChan:	{
+					for k, v := range result {
+						results[k] = v
+					}
+				}
+				case <- time.After(5 * time.Minute): {
+					fmt.Println("timed out, Exiting")
+					return
+				}
+			}	 
 		}
-	}
+	}()
+
+	// Wait for signal to exit
+	<- exitChan
+	
 	// Print summary
 	for k, v := range results {
 		fmt.Println(k,":",v)	
 	}
-	fmt.Println("Completed in ", time.Now().Sub(t0))
+	fmt.Printf("Completed publication of %d services in ", len(results))
+	fmt.Println(time.Now().Sub(t0))
 }
